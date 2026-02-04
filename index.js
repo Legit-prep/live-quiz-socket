@@ -9,87 +9,104 @@ app.use(cors());
 const server = http.createServer(app);
 
 const io = new Server(server, {
-    cors: {
-        origin: "*", 
-        methods: ["GET", "POST"]
-    },
-    transports: ['websocket', 'polling'], // Force WebSocket support
+    cors: { origin: "*", methods: ["GET", "POST"] },
+    transports: ['websocket', 'polling'],
     pingTimeout: 60000,
     pingInterval: 25000
 });
 
-// MEMORY STORAGE
-// Stores: { pin: { currentQuestion: {}, endTime: 1234567890 } }
+// MEMORY STATE
+// roomState[pin] = { 
+//    active: bool, 
+//    correctOption: 'A', 
+//    players: { 'Rahul': { id: 'socket1', score: 0, answer: 'A' } } 
+// }
 let roomState = {}; 
 
 io.on('connection', (socket) => {
-    console.log('User connected:', socket.id);
-
-    // 1. INSTRUCTOR: Creates Session
+    
+    // 1. SETUP
     socket.on('create_session', (pin) => {
         socket.join(pin);
-        // Reset state for new session
-        roomState[pin] = { active: false, data: null, endTime: 0 };
-        console.log(`Session created: ${pin}`);
+        if(!roomState[pin]) roomState[pin] = { players: {}, correctOption: null };
     });
 
-    // 2. STUDENT: Joins (Includes Late Join Logic)
     socket.on('join_session', (data) => {
         socket.join(data.pin);
         
-        // Update headcount
-        const room = io.sockets.adapter.rooms.get(data.pin);
-        const count = room ? room.size : 0;
-        io.to(data.pin).emit('update_count', count);
-
-        // --- LATE JOIN LOGIC ---
-        const state = roomState[data.pin];
-        if (state && state.active) {
-            const now = Date.now();
-            const remainingTime = Math.ceil((state.endTime - now) / 1000);
-
-            if (remainingTime > 0) {
-                // Send the ACTIVE question to this specific late student immediately
-                console.log(`Late joiner ${socket.id} syncing to active question.`);
-                socket.emit('question_started', {
-                    ...state.data,
-                    time: remainingTime // Override total time with ACTUAL remaining time
-                });
-            }
+        // Init Room
+        if(!roomState[data.pin]) roomState[data.pin] = { players: {}, correctOption: null };
+        
+        // Init Player (Persist score by Name)
+        let player = roomState[data.pin].players[data.name];
+        if (!player) {
+            roomState[data.pin].players[data.name] = { id: socket.id, score: 0, answer: null };
+        } else {
+            player.id = socket.id; // Update socket on reconnect
         }
+
+        // Update count
+        io.to(data.pin).emit('update_count', Object.keys(roomState[data.pin].players).length);
     });
 
-    // 3. INSTRUCTOR: Starts Question
+    // 2. START QUESTION
     socket.on('start_timer', (data) => {
-        // Save to Memory
-        roomState[data.pin] = {
-            active: true,
-            data: data,
-            endTime: Date.now() + (data.time * 1000) + 1000 // Add 1s buffer
-        };
+        if(!roomState[data.pin]) return;
+        
+        // Store Correct Option
+        roomState[data.pin].correctOption = data.correctOption; 
+        
+        // Reset Player Answers for this round
+        for (let name in roomState[data.pin].players) {
+            roomState[data.pin].players[name].answer = null;
+        }
 
-        // Broadcast to everyone
         io.to(data.pin).emit('question_started', data);
     });
 
-    // 4. STUDENT: Submits Answer
+    // 3. RECEIVE ANSWER
     socket.on('submit_answer', (data) => {
-        io.to(data.pin).emit('receive_answer', data.answer); 
-    });
-
-    // 5. INSTRUCTOR: Ends/Clears Question state
-    socket.on('stop_timer', (pin) => {
-        if(roomState[pin]) {
-            roomState[pin].active = false;
+        // data: { pin, name, answer }
+        if (roomState[data.pin] && roomState[data.pin].players[data.name]) {
+            roomState[data.pin].players[data.name].answer = data.answer;
+            // Update Graph
+            io.to(data.pin).emit('receive_answer', data.answer); 
         }
     });
 
-    socket.on('disconnect', () => {
-        console.log('User disconnected:', socket.id);
+    // 4. TIME UP & CALCULATE SCORES (The Magic Part)
+    socket.on('time_up', (pin) => {
+        let state = roomState[pin];
+        if (!state) return;
+
+        let correct = state.correctOption;
+        let leaderboard = [];
+
+        // Calculate Scores
+        for (let name in state.players) {
+            let p = state.players[name];
+            let isCorrect = (p.answer === correct);
+            
+            if (isCorrect) p.score += 10; // +10 Points
+
+            // Send Result to Individual Student
+            io.to(p.id).emit('question_result', {
+                correct: isCorrect,
+                score: p.score,
+                correctOption: correct
+            });
+
+            leaderboard.push({ name: name, score: p.score });
+        }
+
+        // Sort Top 5
+        leaderboard.sort((a, b) => b.score - a.score);
+        let top5 = leaderboard.slice(0, 5);
+
+        // Send Leaderboard to Instructor
+        io.to(pin).emit('leaderboard_update', top5);
     });
 });
 
 const PORT = process.env.PORT || 8080; 
-server.listen(PORT, () => {
-    console.log(`Socket Server running on port ${PORT}`);
-});
+server.listen(PORT, () => { console.log(`Server running on ${PORT}`); });
