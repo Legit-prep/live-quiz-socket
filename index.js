@@ -15,8 +15,6 @@ const io = new Server(server, {
     }
 });
 
-let sessions = {}; 
-
 io.on('connection', (socket) => {
     console.log('User connected:', socket.id);
 
@@ -29,22 +27,25 @@ io.on('connection', (socket) => {
     // 2. STUDENT: Joins the Room
     socket.on('join_session', (data) => {
         socket.join(data.pin);
-        // Notify instructor
+        // Notify instructor to update student count
         const room = io.sockets.adapter.rooms.get(data.pin);
         const count = room ? room.size : 0;
         io.to(data.pin).emit('update_count', count);
     });
 
-    // 3. INSTRUCTOR: Starts Question Timer (THE CRITICAL FIX IS HERE)
+    // 3. INSTRUCTOR: Starts Question & Timer
     socket.on('start_timer', (data) => {
-        // OLD CODE: io.to(data.pin).emit('question_started', { time: data.time }); 
-        // NEW CODE: Pass the WHOLE data packet (Question + Options + Time)
+        // Broadcast the full data packet (Question + Options + Time) to everyone in the room
         io.to(data.pin).emit('question_started', data);
     });
 
-    // 4. STUDENT: Submits Answer
-    socket.on('answer_submitted', (pin) => {
-        io.to(pin).emit('new_answer_received'); 
+    // 4. STUDENT: Submits Answer (NEW FEATURE FOR LIVE GRAPH)
+    socket.on('submit_answer', (data) => {
+        // data looks like: { pin: '12345', answer: 'A' }
+        
+        // We broadcast this specific answer back to the room.
+        // The Instructor screen will listen for 'receive_answer' and increase the bar graph.
+        io.to(data.pin).emit('receive_answer', data.answer); 
     });
 
     socket.on('disconnect', () => {
@@ -52,7 +53,7 @@ io.on('connection', (socket) => {
     });
 });
 
-const PORT = process.env.PORT || 8080; // Default to 8080 for Railway
+const PORT = process.env.PORT || 8080; 
 server.listen(PORT, () => {
     console.log(`Socket Server running on port ${PORT}`);
 });
